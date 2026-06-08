@@ -18,12 +18,14 @@ Clone this repository into Codex's skills directory using the skill folder name 
 
 ```bash
 mkdir -p "$HOME/.codex/skills"
-git clone git@github.com:mattivilola/trello-project-workflow-skill-for-codex.git "$HOME/.codex/skills/trello-project-workflow"
+git clone https://github.com/mattivilola/trello-project-workflow-skill-for-codex.git "$HOME/.codex/skills/trello-project-workflow"
 ```
 
 Start a new Codex session after installing so the skill can be discovered.
 
 ## Update
+
+If installed with the HTTPS clone command above:
 
 ```bash
 cd "$HOME/.codex/skills/trello-project-workflow"
@@ -138,4 +140,3 @@ Use `--dry-run` on mutating commands to preview intent without changing Trello.
 ## Safety
 
 The helper intentionally supports only read, create, move, and comment operations. It does not delete, archive, close, or bulk edit Trello cards.
-
