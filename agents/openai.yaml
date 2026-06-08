@@ -1,0 +1,8 @@
+interface:
+  display_name: "Trello Project Workflow"
+  short_description: "Manage project Trello cards"
+  default_prompt: "Use $trello-project-workflow to create or move a Trello card for this project task."
+
+policy:
+  allow_implicit_invocation: true
+
