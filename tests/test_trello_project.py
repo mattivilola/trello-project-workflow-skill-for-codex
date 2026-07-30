@@ -257,6 +257,8 @@ class TrelloProjectTests(unittest.TestCase):
                 return card
             if method == 'GET' and path == '/boards/board/labels':
                 return self.board_labels
+            if method == 'GET' and path == '/cards/card/actions':
+                return [{'data': {'text': 'Do not duplicate'}}]
             mutations.append((method, path, data))
             return {}
 
@@ -271,7 +273,75 @@ class TrelloProjectTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertFalse(result['claimed'])
         self.assertEqual(result['reason'], 'already_in_target')
+        self.assertTrue(result['commentAlreadyPresent'])
         self.assertEqual(mutations, [('DELETE', '/cards/card/idLabels/R', None)])
+
+    def test_retried_claim_adds_missing_comment(self):
+        card = {
+            'id': 'card', 'name': 'Work', 'idList': 'L3', 'idLabels': ['M'],
+            'labels': [{'id': 'M', 'name': 'AI Managed', 'color': 'blue'}],
+            'dateLastActivity': 'newer', 'pos': 10
+        }
+        mutations = []
+
+        def request(method, path, params=None, data=None):
+            if method == 'GET' and path == '/boards/board/lists':
+                return self.board_lists
+            if method == 'GET' and path == '/cards/card':
+                return card
+            if method == 'GET' and path == '/boards/board/labels':
+                return self.board_labels
+            if method == 'GET' and path == '/cards/card/actions':
+                return []
+            mutations.append((method, path, data))
+            if method == 'POST' and path.endswith('/actions/comments'):
+                return {'id': 'comment', 'type': 'commentCard', 'date': 'later'}
+            self.fail(f'unexpected request: {method} {path}')
+
+        namespace = args(
+            cwd=str(self.cwd), card='card', from_list='analyzed', to='start',
+            expected_last_activity='old', require_label=['aiManaged'], exclude_label=['aiHold'],
+            add_label=[], remove_label=[], comment='Claimed for implementation',
+            pos='top', dry_run=False
+        )
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            status, result = run_and_parse(trello.command_claim, namespace)
+        self.assertEqual(status, 0)
+        self.assertFalse(result['claimed'])
+        self.assertFalse(result['commentAlreadyPresent'])
+        self.assertEqual(
+            mutations,
+            [('POST', '/cards/card/actions/comments', {'text': 'Claimed for implementation'})]
+        )
+
+    def test_retried_claim_still_rejects_excluded_label(self):
+        card = {
+            'id': 'card', 'name': 'Work', 'idList': 'L3', 'idLabels': ['M', 'H'],
+            'labels': [
+                {'id': 'M', 'name': 'AI Managed', 'color': 'blue'},
+                {'id': 'H', 'name': 'AI Hold', 'color': 'red'}
+            ],
+            'dateLastActivity': 'newer', 'pos': 10
+        }
+
+        def request(_method, path, _params=None, data=None):
+            if path == '/boards/board/lists':
+                return self.board_lists
+            if path == '/cards/card':
+                return card
+            if path == '/boards/board/labels':
+                return self.board_labels
+            self.fail(f'unexpected request: {path}')
+
+        namespace = args(
+            cwd=str(self.cwd), card='card', from_list='analyzed', to='start',
+            expected_last_activity='old', require_label=['aiManaged'], exclude_label=['aiHold'],
+            add_label=[], remove_label=[], comment='Claimed for implementation',
+            pos='top', dry_run=False
+        )
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            with self.assertRaisesRegex(trello.TrelloError, 'excluded label.*AI Hold'):
+                trello.command_claim(namespace)
 
     def test_card_context_includes_creator_comments_and_sorted_checklists(self):
         card = {

@@ -316,6 +316,17 @@ def add_card_comment(card_id, text):
     return request_json('POST', f'/cards/{card_id}/actions/comments', data={'text': text})
 
 
+def card_has_exact_comment(card_id, text):
+    actions = request_json('GET', f'/cards/{card_id}/actions', {
+        'filter': 'commentCard',
+        'limit': 1000
+    })
+    return any(
+        (action.get('data') or {}).get('text') == text
+        for action in (actions or [])
+    )
+
+
 def command_config_check(args):
     config_path, config = load_config(args.cwd)
     require_credentials()
@@ -788,21 +799,30 @@ def command_claim(args):
     add_labels = [require_label(config, ref, board_labels) for ref in args.add_label]
     remove_labels = [require_label(config, ref, board_labels) for ref in args.remove_label]
     present_ids = set(card.get('idLabels') or [])
-
-    if not already_in_target:
-        missing_required = [label['name'] for label in required if label['id'] not in present_ids]
-        present_excluded = [label['name'] for label in excluded if label['id'] in present_ids]
-        if missing_required:
-            raise TrelloError('Claim rejected: missing required label(s): ' + ', '.join(missing_required))
-        if present_excluded:
-            raise TrelloError('Claim rejected: excluded label(s) present: ' + ', '.join(present_excluded))
-
     add_ids = {label['id'] for label in add_labels}
     remove_ids = {label['id'] for label in remove_labels}
     overlap = add_ids & remove_ids
     if overlap:
         names = [label['name'] for label in add_labels if label['id'] in overlap]
         raise TrelloError('Cannot add and remove the same label(s): ' + ', '.join(names))
+
+    # A retry may observe label mutations from the interrupted claim. Preserve
+    # those intentional transitions while still enforcing unrelated gates such
+    # as AI Hold on every attempt.
+    missing_required = [
+        label['name'] for label in required
+        if label['id'] not in present_ids
+        and (not already_in_target or label['id'] not in remove_ids)
+    ]
+    present_excluded = [
+        label['name'] for label in excluded
+        if label['id'] in present_ids
+        and (not already_in_target or label['id'] not in add_ids)
+    ]
+    if missing_required:
+        raise TrelloError('Claim rejected: missing required label(s): ' + ', '.join(missing_required))
+    if present_excluded:
+        raise TrelloError('Claim rejected: excluded label(s) present: ' + ', '.join(present_excluded))
 
     preview = {
         'operation': 'claim',
@@ -836,12 +856,17 @@ def command_claim(args):
         if label['id'] in present_ids:
             request_json('DELETE', f'/cards/{card_id}/idLabels/{label["id"]}')
             changed_labels.append({'operation': 'remove', **normalize_label(label)})
-    # A retried claim may finish interrupted label changes, but must not duplicate
-    # the original claim comment.
-    comment_action = (
-        add_card_comment(card_id, args.comment)
-        if args.comment and not already_in_target else None
-    )
+    # A retried claim may finish interrupted label/comment changes. Query exact
+    # comment text so a lost response does not create a duplicate, while a
+    # failure before comment creation can still be repaired.
+    comment_already_present = False
+    comment_action = None
+    if args.comment:
+        comment_already_present = (
+            already_in_target and card_has_exact_comment(card_id, args.comment)
+        )
+        if not comment_already_present:
+            comment_action = add_card_comment(card_id, args.comment)
 
     result = {
         'claimed': not already_in_target,
@@ -853,7 +878,8 @@ def command_claim(args):
             'url': moved.get('url', card.get('url')),
             'idList': moved.get('idList', target_list['id'])
         },
-        'changedLabels': changed_labels
+        'changedLabels': changed_labels,
+        'commentAlreadyPresent': comment_already_present
     }
     if comment_action:
         result['commentAction'] = {
