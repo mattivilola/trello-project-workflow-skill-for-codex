@@ -124,6 +124,13 @@ def configured_lists(config):
     return lists
 
 
+def configured_labels(config):
+    labels = config.get('labels') or {}
+    if not isinstance(labels, dict):
+        raise TrelloError('Invalid labels mapping in .codex/trello.json; expected an object')
+    return labels
+
+
 def fetch_board_lists(config):
     return request_json('GET', f'/boards/{board_id(config)}/lists', {
         'fields': 'name,closed,pos',
@@ -155,11 +162,111 @@ def require_list(config, list_key):
     return resolved[list_key]
 
 
+def fetch_board_labels(config):
+    return request_json('GET', f'/boards/{board_id(config)}/labels', {
+        'fields': 'name,color',
+        'limit': 1000
+    })
+
+
+def configured_label_name(config, label_ref):
+    labels = configured_labels(config)
+    return str(labels.get(label_ref, label_ref)).strip()
+
+
+def resolve_label_from_items(config, label_ref, board_labels):
+    wanted = configured_label_name(config, label_ref)
+    if not wanted:
+        raise TrelloError('Label name must not be empty')
+    matches = [
+        label for label in board_labels
+        if str(label.get('name') or '').strip().lower() == wanted.lower()
+    ]
+    if not matches:
+        raise TrelloError(f'Label "{label_ref}" not found on board (resolved name: {wanted})')
+    if len(matches) > 1:
+        raise TrelloError(f'Label name is ambiguous on board: {wanted}')
+    return matches[0]
+
+
+def require_label(config, label_ref, board_labels=None):
+    items = board_labels if board_labels is not None else fetch_board_labels(config)
+    return resolve_label_from_items(config, label_ref, items)
+
+
+def resolve_configured_labels(config, board_labels=None):
+    if not configured_labels(config) and board_labels is None:
+        return {}, {}, []
+    items = board_labels if board_labels is not None else fetch_board_labels(config)
+    resolved = {}
+    missing = {}
+    for key, name in configured_labels(config).items():
+        try:
+            resolved[key] = resolve_label_from_items(config, key, items)
+        except TrelloError:
+            missing[key] = name
+    return resolved, missing, items
+
+
 def configured_list_name(config, list_key):
     lists = configured_lists(config)
     if list_key not in lists:
         raise TrelloError(f'List key "{list_key}" not configured in .codex/trello.json')
     return lists[list_key]
+
+
+def normalize_label(label):
+    return {
+        'id': label.get('id'),
+        'name': label.get('name'),
+        'color': label.get('color')
+    }
+
+
+def normalize_member(member):
+    return {
+        'id': member.get('id'),
+        'username': member.get('username'),
+        'fullName': member.get('fullName')
+    }
+
+
+def normalize_card_summary(card):
+    return {
+        'id': card['id'],
+        'shortLink': card.get('shortLink'),
+        'name': card.get('name'),
+        'url': card.get('url'),
+        'dateLastActivity': card.get('dateLastActivity'),
+        'idList': card.get('idList'),
+        'pos': card.get('pos'),
+        'labels': [normalize_label(label) for label in card.get('labels', [])],
+        'idMembers': card.get('idMembers', [])
+    }
+
+
+def card_matches_label_ids(card, required, excluded):
+    present = set(card.get('idLabels') or [])
+    return (
+        {label['id'] for label in required}.issubset(present)
+        and present.isdisjoint({label['id'] for label in excluded})
+    )
+
+
+def fetch_list_cards(trello_list):
+    cards = request_json('GET', f'/lists/{trello_list["id"]}/cards', {
+        'fields': 'name,desc,url,shortLink,dateLastActivity,idList,closed,pos,idLabels,idMembers',
+        'labels': 'all',
+        'filter': 'open'
+    })
+    return sorted(cards, key=lambda card: (card.get('pos', float('inf')), card.get('id', '')))
+
+
+def fetch_card_state(card_id):
+    return request_json('GET', f'/cards/{card_id}', {
+        'fields': 'name,desc,url,shortLink,dateLastActivity,idList,closed,pos,idLabels,idMembers',
+        'labels': 'all'
+    })
 
 
 def strip_named_prefix(value, prefix):
@@ -213,8 +320,9 @@ def command_config_check(args):
     config_path, config = load_config(args.cwd)
     require_credentials()
     resolved, missing, _ = resolve_lists(config)
+    resolved_labels, missing_labels, _ = resolve_configured_labels(config)
     result = {
-        'ok': not missing,
+        'ok': not missing and not missing_labels,
         'configPath': str(config_path),
         'board': config.get('board'),
         'resolvedLists': {
@@ -224,10 +332,15 @@ def command_config_check(args):
             }
             for key, item in resolved.items()
         },
-        'missingLists': missing
+        'missingLists': missing,
+        'resolvedLabels': {
+            key: normalize_label(item)
+            for key, item in resolved_labels.items()
+        },
+        'missingLabels': missing_labels
     }
     print_json(result)
-    return 0 if not missing else 2
+    return 0 if not missing and not missing_labels else 2
 
 
 def command_init_config(args):
@@ -247,6 +360,7 @@ def command_init_config(args):
     if args.done_list:
         lists['done'] = args.done_list
     lists.update(parse_list_mapping(args.list))
+    labels = parse_list_mapping(args.label)
 
     if not lists:
         raise TrelloError('Missing list mapping. Provide --start-list/--implemented-list/--verified-list or --list KEY=NAME.')
@@ -262,6 +376,8 @@ def command_init_config(args):
             'position': args.position
         }
     }
+    if labels:
+        config['labels'] = labels
 
     target = output_config_path(args.cwd, args.output)
     if not args.write:
@@ -311,23 +427,42 @@ def command_lists(args):
     return 0 if not missing else 2
 
 
+def command_labels(args):
+    _, config = load_config(args.cwd)
+    board_labels = fetch_board_labels(config)
+    resolved, missing, _ = resolve_configured_labels(config, board_labels)
+    result = {
+        'configured': {
+            key: normalize_label(item)
+            for key, item in resolved.items()
+        },
+        'missing': missing,
+        'boardLabels': [normalize_label(label) for label in board_labels]
+    }
+    print_json(result)
+    return 0 if not missing else 2
+
+
 def command_cards(args):
     _, config = load_config(args.cwd)
     trello_list = require_list(config, args.list_key)
-    cards = request_json('GET', f'/lists/{trello_list["id"]}/cards', {
-        'fields': 'name,desc,url,shortLink,dateLastActivity,idList,closed',
-        'filter': 'open'
-    })
-    print_json([
-        {
-            'id': card['id'],
-            'shortLink': card.get('shortLink'),
-            'name': card.get('name'),
-            'url': card.get('url'),
-            'dateLastActivity': card.get('dateLastActivity')
-        }
-        for card in cards
-    ])
+    cards = fetch_list_cards(trello_list)
+    print_json([normalize_card_summary(card) for card in cards])
+    return 0
+
+
+def command_next_card(args):
+    _, config = load_config(args.cwd)
+    trello_list = require_list(config, args.list_key)
+    cards = fetch_list_cards(trello_list)
+    board_labels = fetch_board_labels(config) if args.require_label or args.exclude_label else []
+    required = [require_label(config, ref, board_labels) for ref in args.require_label]
+    excluded = [require_label(config, ref, board_labels) for ref in args.exclude_label]
+    matches = [
+        card for card in cards
+        if card_matches_label_ids(card, required, excluded)
+    ]
+    print_json(normalize_card_summary(matches[0]) if matches else None)
     return 0
 
 
@@ -358,6 +493,112 @@ def command_card(args):
             for attachment in card.get('attachments', [])
         ]
     })
+    return 0
+
+
+def normalize_action(action):
+    member = action.get('memberCreator') or {}
+    return {
+        'id': action.get('id'),
+        'type': action.get('type'),
+        'date': action.get('date'),
+        'memberCreator': normalize_member(member) if member else None,
+        'data': action.get('data') or {}
+    }
+
+
+def fetch_card_actions(card_id, actions_limit):
+    common = {
+        'memberCreator': 'true',
+        'memberCreator_fields': 'fullName,username'
+    }
+    recent = request_json('GET', f'/cards/{card_id}/actions', {
+        **common,
+        'filter': 'commentCard,updateCard:idList,addLabelToCard,removeLabelFromCard',
+        'limit': actions_limit
+    })
+    created = request_json('GET', f'/cards/{card_id}/actions', {
+        **common,
+        'filter': 'createCard',
+        'limit': 1
+    })
+    by_id = {
+        action.get('id'): action
+        for action in [*(recent or []), *(created or [])]
+        if action.get('id')
+    }
+    return sorted(by_id.values(), key=lambda action: action.get('date') or '')
+
+
+def command_card_context(args):
+    _, config = load_config(args.cwd)
+    if args.actions_limit < 1 or args.actions_limit > 1000:
+        raise TrelloError('--actions-limit must be between 1 and 1000')
+    card_id = normalize_card_id(args.card)
+    card = request_json('GET', f'/cards/{card_id}', {
+        'fields': 'name,desc,url,shortLink,dateLastActivity,idList,closed,pos,idLabels,idMembers',
+        'attachments': 'true',
+        'attachment_fields': 'name,url,date,mimeType',
+        'labels': 'all',
+        'members': 'true',
+        'member_fields': 'fullName,username',
+        'checklists': 'all',
+        'checklist_fields': 'name,pos',
+        'checkItem_fields': 'name,state,pos'
+    })
+    actions = fetch_card_actions(card_id, args.actions_limit)
+    creator_action = next((action for action in actions if action.get('type') == 'createCard'), None)
+    board_lists = fetch_board_lists(config)
+    list_by_id = {item['id']: item['name'] for item in board_lists}
+    result = {
+        **normalize_card_summary(card),
+        'desc': card.get('desc'),
+        'closed': card.get('closed'),
+        'list': {
+            'id': card.get('idList'),
+            'name': list_by_id.get(card.get('idList'))
+        },
+        'creator': (
+            normalize_member(creator_action.get('memberCreator') or {})
+            if creator_action else None
+        ),
+        'members': [normalize_member(member) for member in card.get('members', [])],
+        'attachments': [
+            {
+                'id': attachment.get('id'),
+                'name': attachment.get('name'),
+                'url': attachment.get('url'),
+                'date': attachment.get('date'),
+                'mimeType': attachment.get('mimeType')
+            }
+            for attachment in card.get('attachments', [])
+        ],
+        'checklists': [
+            {
+                'id': checklist.get('id'),
+                'name': checklist.get('name'),
+                'pos': checklist.get('pos'),
+                'items': [
+                    {
+                        'id': item.get('id'),
+                        'name': item.get('name'),
+                        'state': item.get('state'),
+                        'pos': item.get('pos')
+                    }
+                    for item in sorted(
+                        checklist.get('checkItems', []),
+                        key=lambda value: value.get('pos', float('inf'))
+                    )
+                ]
+            }
+            for checklist in sorted(
+                card.get('checklists', []),
+                key=lambda value: value.get('pos', float('inf'))
+            )
+        ],
+        'actions': [normalize_action(action) for action in actions]
+    }
+    print_json(result)
     return 0
 
 
@@ -460,6 +701,167 @@ def command_comment(args):
         'type': action.get('type'),
         'date': action.get('date')
     })
+    return 0
+
+
+def command_whoami(args):
+    load_config(args.cwd)
+    member = request_json('GET', '/members/me', {
+        'fields': 'username,fullName,url'
+    })
+    print_json({
+        **normalize_member(member),
+        'url': member.get('url')
+    })
+    return 0
+
+
+def command_change_label(args, add):
+    _, config = load_config(args.cwd)
+    card_id = normalize_card_id(args.card)
+    card = fetch_card_state(card_id)
+    label = require_label(config, args.label)
+    present = label['id'] in (card.get('idLabels') or [])
+    changed = (add and not present) or (not add and present)
+    operation = 'add-label' if add else 'remove-label'
+
+    if args.dry_run:
+        print_json({
+            'dryRun': True,
+            'operation': operation,
+            'card': normalize_card_summary(card),
+            'label': normalize_label(label),
+            'wouldChange': changed
+        })
+        return 0
+
+    if changed:
+        if add:
+            request_json('POST', f'/cards/{card_id}/idLabels', data={'value': label['id']})
+        else:
+            request_json('DELETE', f'/cards/{card_id}/idLabels/{label["id"]}')
+    print_json({
+        'operation': operation,
+        'card': card_id,
+        'label': normalize_label(label),
+        'changed': changed
+    })
+    return 0
+
+
+def command_add_label(args):
+    return command_change_label(args, True)
+
+
+def command_remove_label(args):
+    return command_change_label(args, False)
+
+
+def command_claim(args):
+    _, config = load_config(args.cwd)
+    card_id = normalize_card_id(args.card)
+    source_list = require_list(config, args.from_list)
+    target_list = require_list(config, args.to)
+    card = fetch_card_state(card_id)
+
+    if card.get('closed'):
+        raise TrelloError('Cannot claim a closed card')
+    already_in_target = card.get('idList') == target_list['id']
+    if not already_in_target and card.get('idList') != source_list['id']:
+        raise TrelloError(
+            f'Claim rejected: card is not in configured source list "{args.from_list}" '
+            f'({source_list["name"]})'
+        )
+    if (
+        not already_in_target
+        and args.expected_last_activity
+        and card.get('dateLastActivity') != args.expected_last_activity
+    ):
+        raise TrelloError(
+            'Claim rejected: card changed after selection '
+            f'(expected {args.expected_last_activity}, found {card.get("dateLastActivity")})'
+        )
+
+    board_labels = fetch_board_labels(config)
+    required = [require_label(config, ref, board_labels) for ref in args.require_label]
+    excluded = [require_label(config, ref, board_labels) for ref in args.exclude_label]
+    add_labels = [require_label(config, ref, board_labels) for ref in args.add_label]
+    remove_labels = [require_label(config, ref, board_labels) for ref in args.remove_label]
+    present_ids = set(card.get('idLabels') or [])
+
+    if not already_in_target:
+        missing_required = [label['name'] for label in required if label['id'] not in present_ids]
+        present_excluded = [label['name'] for label in excluded if label['id'] in present_ids]
+        if missing_required:
+            raise TrelloError('Claim rejected: missing required label(s): ' + ', '.join(missing_required))
+        if present_excluded:
+            raise TrelloError('Claim rejected: excluded label(s) present: ' + ', '.join(present_excluded))
+
+    add_ids = {label['id'] for label in add_labels}
+    remove_ids = {label['id'] for label in remove_labels}
+    overlap = add_ids & remove_ids
+    if overlap:
+        names = [label['name'] for label in add_labels if label['id'] in overlap]
+        raise TrelloError('Cannot add and remove the same label(s): ' + ', '.join(names))
+
+    preview = {
+        'operation': 'claim',
+        'card': normalize_card_summary(card),
+        'from': {'key': args.from_list, 'id': source_list['id'], 'name': source_list['name']},
+        'to': {'key': args.to, 'id': target_list['id'], 'name': target_list['name']},
+        'pos': args.pos,
+        'requiredLabels': [normalize_label(label) for label in required],
+        'excludedLabels': [normalize_label(label) for label in excluded],
+        'addLabels': [normalize_label(label) for label in add_labels],
+        'removeLabels': [normalize_label(label) for label in remove_labels],
+        'comment': args.comment,
+        'alreadyInTarget': already_in_target
+    }
+    if args.dry_run:
+        print_json({'dryRun': True, **preview})
+        return 0
+
+    moved = card
+    if not already_in_target:
+        moved = request_json('PUT', f'/cards/{card_id}', data={
+            'idList': target_list['id'],
+            'pos': args.pos
+        })
+    changed_labels = []
+    for label in add_labels:
+        if label['id'] not in present_ids:
+            request_json('POST', f'/cards/{card_id}/idLabels', data={'value': label['id']})
+            changed_labels.append({'operation': 'add', **normalize_label(label)})
+    for label in remove_labels:
+        if label['id'] in present_ids:
+            request_json('DELETE', f'/cards/{card_id}/idLabels/{label["id"]}')
+            changed_labels.append({'operation': 'remove', **normalize_label(label)})
+    # A retried claim may finish interrupted label changes, but must not duplicate
+    # the original claim comment.
+    comment_action = (
+        add_card_comment(card_id, args.comment)
+        if args.comment and not already_in_target else None
+    )
+
+    result = {
+        'claimed': not already_in_target,
+        'reason': 'already_in_target' if already_in_target else 'moved',
+        **preview,
+        'card': {
+            'id': moved.get('id', card_id),
+            'name': moved.get('name', card.get('name')),
+            'url': moved.get('url', card.get('url')),
+            'idList': moved.get('idList', target_list['id'])
+        },
+        'changedLabels': changed_labels
+    }
+    if comment_action:
+        result['commentAction'] = {
+            'id': comment_action.get('id'),
+            'type': comment_action.get('type'),
+            'date': comment_action.get('date')
+        }
+    print_json(result)
     return 0
 
 
@@ -566,6 +968,7 @@ def build_parser():
     init_config.add_argument('--incoming-bugs-list')
     init_config.add_argument('--done-list')
     init_config.add_argument('--list', action='append', default=[], help='Additional or overriding semantic list mapping as KEY=NAME.')
+    init_config.add_argument('--label', action='append', default=[], help='Semantic label mapping as KEY=NAME.')
     init_config.add_argument('--prefix', default=DEFAULT_CARD_PREFIX)
     init_config.add_argument('--position', default=DEFAULT_CARD_POSITION)
     init_config.add_argument('--output')
@@ -576,13 +979,30 @@ def build_parser():
     lists = subparsers.add_parser('lists')
     lists.set_defaults(func=command_lists)
 
+    labels = subparsers.add_parser('labels')
+    labels.set_defaults(func=command_labels)
+
     cards = subparsers.add_parser('cards')
     cards.add_argument('--list-key', required=True)
     cards.set_defaults(func=command_cards)
 
+    next_card = subparsers.add_parser('next-card')
+    next_card.add_argument('--list-key', required=True)
+    next_card.add_argument('--require-label', action='append', default=[])
+    next_card.add_argument('--exclude-label', action='append', default=[])
+    next_card.set_defaults(func=command_next_card)
+
     card = subparsers.add_parser('card')
     card.add_argument('--card', required=True)
     card.set_defaults(func=command_card)
+
+    card_context = subparsers.add_parser('card-context')
+    card_context.add_argument('--card', required=True)
+    card_context.add_argument('--actions-limit', type=int, default=100)
+    card_context.set_defaults(func=command_card_context)
+
+    whoami = subparsers.add_parser('whoami')
+    whoami.set_defaults(func=command_whoami)
 
     create = subparsers.add_parser('create')
     create.add_argument('--title', required=True)
@@ -605,6 +1025,32 @@ def build_parser():
     comment.add_argument('--text', required=True)
     comment.add_argument('--dry-run', action='store_true')
     comment.set_defaults(func=command_comment)
+
+    add_label = subparsers.add_parser('add-label')
+    add_label.add_argument('--card', required=True)
+    add_label.add_argument('--label', required=True)
+    add_label.add_argument('--dry-run', action='store_true')
+    add_label.set_defaults(func=command_add_label)
+
+    remove_label = subparsers.add_parser('remove-label')
+    remove_label.add_argument('--card', required=True)
+    remove_label.add_argument('--label', required=True)
+    remove_label.add_argument('--dry-run', action='store_true')
+    remove_label.set_defaults(func=command_remove_label)
+
+    claim = subparsers.add_parser('claim')
+    claim.add_argument('--card', required=True)
+    claim.add_argument('--from', dest='from_list', required=True)
+    claim.add_argument('--to', required=True)
+    claim.add_argument('--expected-last-activity')
+    claim.add_argument('--require-label', action='append', default=[])
+    claim.add_argument('--exclude-label', action='append', default=[])
+    claim.add_argument('--add-label', action='append', default=[])
+    claim.add_argument('--remove-label', action='append', default=[])
+    claim.add_argument('--comment')
+    claim.add_argument('--pos', default=DEFAULT_CARD_POSITION)
+    claim.add_argument('--dry-run', action='store_true')
+    claim.set_defaults(func=command_claim)
 
     resume = subparsers.add_parser('resume')
     resume.add_argument('--card', required=True)
