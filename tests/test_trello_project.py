@@ -43,7 +43,16 @@ class TrelloProjectTests(unittest.TestCase):
                 'aiReady': 'AI Ready',
                 'aiManaged': 'AI Managed',
                 'aiNeedsInput': 'AI Needs Input',
-                'aiHold': 'AI Hold'
+                'aiHold': 'AI Hold',
+                'aiLocal': 'AI Local'
+            },
+            'ownership': {
+                'localLabel': 'aiLocal',
+                'localTitlePrefix': '[LOCAL]',
+                'localCommentPrefix': 'AI-LOCAL',
+                'managedLabels': ['aiReady', 'aiManaged', 'aiNeedsInput', 'aiHold'],
+                'managedCommentPrefixes': ['[BUZZ-AI:', '[AI-WORKFLOW:'],
+                'requireLocalForStandardMutations': True
             },
             'cardDefaults': {'prefix': 'v3', 'position': 'top'}
         }
@@ -57,7 +66,8 @@ class TrelloProjectTests(unittest.TestCase):
             {'id': 'R', 'name': 'AI Ready', 'color': 'green'},
             {'id': 'M', 'name': 'AI Managed', 'color': 'blue'},
             {'id': 'N', 'name': 'AI Needs Input', 'color': 'yellow'},
-            {'id': 'H', 'name': 'AI Hold', 'color': 'red'}
+            {'id': 'H', 'name': 'AI Hold', 'color': 'red'},
+            {'id': 'L', 'name': 'AI Local', 'color': 'lime'}
         ]
 
     def tearDown(self):
@@ -78,8 +88,137 @@ class TrelloProjectTests(unittest.TestCase):
         self.assertEqual(parsed['labels']['aiReady'], 'AI Ready')
         self.assertEqual(result['config'], parsed)
 
+    def test_local_create_adds_label_title_and_claim_marker(self):
+        mutations = []
+
+        def request(method, path, params=None, data=None):
+            if method == 'GET' and path == '/boards/board/labels':
+                return self.board_labels
+            if method == 'GET' and path == '/boards/board/lists':
+                return self.board_lists
+            mutations.append((method, path, data))
+            if method == 'POST' and path == '/cards':
+                return {
+                    'id': 'card', 'shortLink': 'abc', 'name': data['name'],
+                    'url': 'https://trello.test/card'
+                }
+            if method == 'POST' and path == '/cards/card/actions/comments':
+                return {'id': 'comment', 'type': 'commentCard', 'date': 'now'}
+            self.fail(f'unexpected request: {method} {path}')
+
+        namespace = args(
+            cwd=str(self.cwd), title='Work', desc='Context', list_key='start',
+            pos=None, thread_id='thread-123', dry_run=False
+        )
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            status, result = run_and_parse(trello.command_create, namespace)
+        self.assertEqual(status, 0)
+        self.assertEqual(mutations[0][1], '/cards')
+        self.assertEqual(mutations[0][2]['name'], '[LOCAL] v3: Work')
+        self.assertEqual(mutations[0][2]['idLabels'], 'L')
+        self.assertEqual(
+            mutations[1],
+            ('POST', '/cards/card/actions/comments', {
+                'text': '[AI-LOCAL:CLAIM thread=thread-123]'
+            })
+        )
+        self.assertEqual(result['ownership']['lane'], 'local')
+
+    def test_local_create_requires_thread_id_before_mutation(self):
+        namespace = args(
+            cwd=str(self.cwd), title='Work', desc='', list_key='start',
+            pos=None, thread_id=None, dry_run=False
+        )
+        with self.assertRaisesRegex(trello.TrelloError, '--thread-id'):
+            trello.command_create(namespace)
+
+    def test_local_finish_rejects_buzz_marker(self):
+        card = {
+            'id': 'card', 'name': '[LOCAL] v3: Work', 'idList': 'L3',
+            'idLabels': ['L'],
+            'labels': [{'id': 'L', 'name': 'AI Local', 'color': 'lime'}],
+            'closed': False
+        }
+
+        def request(method, path, params=None, data=None):
+            if method == 'GET' and path == '/cards/card':
+                return card
+            if method == 'GET' and path == '/boards/board/labels':
+                return self.board_labels
+            if method == 'GET' and path == '/cards/card/actions':
+                return [
+                    {'data': {'text': '[AI-LOCAL:CLAIM thread=thread-123]'}},
+                    {'data': {'text': '[BUZZ-AI:WORKER-ASSIGNED worker=dev-2]'}}
+                ]
+            self.fail(f'unexpected request: {method} {path}')
+
+        namespace = args(
+            cwd=str(self.cwd), card='card', overview='Done', to='implemented',
+            pos='top', thread_id='thread-123', dry_run=True
+        )
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            with self.assertRaisesRegex(trello.TrelloError, 'Buzz ownership marker'):
+                trello.command_finish(namespace)
+
+    def test_adding_ai_local_rejects_legacy_buzz_marker(self):
+        card = {
+            'id': 'card', 'name': 'Work', 'idList': 'L3', 'idLabels': [],
+            'labels': [], 'closed': False
+        }
+
+        def request(method, path, params=None, data=None):
+            if method == 'GET' and path == '/cards/card':
+                return card
+            if method == 'GET' and path == '/boards/board/labels':
+                return self.board_labels
+            if method == 'GET' and path == '/cards/card/actions':
+                return [{'data': {'text': '[AI-WORKFLOW:WORKER-ASSIGNED worker=dev-3]'}}]
+            self.fail(f'unexpected request: {method} {path}')
+
+        namespace = args(cwd=str(self.cwd), card='card', label='aiLocal', dry_run=False)
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            with self.assertRaisesRegex(trello.TrelloError, 'Buzz ownership marker'):
+                trello.command_add_label(namespace)
+
+    def test_managed_claim_always_excludes_ai_local(self):
+        card = {
+            'id': 'card', 'name': 'Work', 'idList': 'L2', 'idLabels': ['M', 'L'],
+            'labels': [
+                {'id': 'M', 'name': 'AI Managed', 'color': 'blue'},
+                {'id': 'L', 'name': 'AI Local', 'color': 'lime'}
+            ],
+            'dateLastActivity': 'stamp', 'closed': False
+        }
+
+        def request(_method, path, _params=None, data=None):
+            if path == '/boards/board/lists':
+                return self.board_lists
+            if path == '/cards/card':
+                return card
+            if path == '/boards/board/labels':
+                return self.board_labels
+            self.fail(f'unexpected request: {path}')
+
+        namespace = args(
+            cwd=str(self.cwd), card='card', from_list='analyzed', to='start',
+            expected_last_activity='stamp', require_label=['aiManaged'],
+            exclude_label=['aiHold'], add_label=[], remove_label=[], comment='Claimed',
+            pos='top', dry_run=True
+        )
+        with mock.patch.object(trello, 'request_json', side_effect=request):
+            with self.assertRaisesRegex(trello.TrelloError, 'excluded label.*AI Local'):
+                trello.command_claim(namespace)
+
     def test_next_card_preserves_priority_and_applies_semantic_labels(self):
         cards = [
+            {
+                'id': 'local', 'name': 'Local', 'pos': 25, 'idList': 'L1',
+                'labels': [
+                    {'id': 'R', 'name': 'AI Ready', 'color': 'green'},
+                    {'id': 'L', 'name': 'AI Local', 'color': 'lime'}
+                ],
+                'idLabels': ['R', 'L'], 'idMembers': []
+            },
             {
                 'id': 'lower', 'name': 'Lower', 'pos': 200, 'idList': 'L1',
                 'labels': [{'id': 'R', 'name': 'AI Ready', 'color': 'green'}],
@@ -377,6 +516,7 @@ class TrelloProjectTests(unittest.TestCase):
             status, result = run_and_parse(trello.command_card_context, namespace)
         self.assertEqual(status, 0)
         self.assertEqual(result['creator']['username'], 'alice')
+        self.assertEqual(result['ownership']['lane'], 'unowned')
         self.assertEqual(result['checklists'][0]['items'][0]['name'], 'First')
         self.assertEqual([action['type'] for action in result['actions']], ['createCard', 'commentCard'])
 

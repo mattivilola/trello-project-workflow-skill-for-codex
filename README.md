@@ -67,7 +67,16 @@ Each project uses `.codex/trello.json`:
     "aiReady": "AI Ready",
     "aiManaged": "AI Managed",
     "aiNeedsInput": "AI Needs Input",
-    "aiHold": "AI Hold"
+    "aiHold": "AI Hold",
+    "aiLocal": "AI Local"
+  },
+  "ownership": {
+    "localLabel": "aiLocal",
+    "localTitlePrefix": "[LOCAL]",
+    "localCommentPrefix": "AI-LOCAL",
+    "managedLabels": ["aiReady", "aiManaged", "aiNeedsInput", "aiHold"],
+    "managedCommentPrefixes": ["[BUZZ-AI:", "[AI-WORKFLOW:"],
+    "requireLocalForStandardMutations": true
   },
   "cardDefaults": {
     "prefix": "v3",
@@ -113,7 +122,7 @@ python "$helper" card-context --card abc123 --actions-limit 100
 
 `next-card` returns the highest eligible card according to Trello position. It prints JSON `null` with exit status 0 when nothing qualifies.
 
-`card-context` returns the card's description, current list and labels, creator, members, attachments, ordered checklists, and chronological actions. Actions include comments, creation, list movements, and label changes.
+`card-context` returns the card's description, current list and labels, ownership lane, creator, members, attachments, ordered checklists, and chronological actions. Actions include comments, creation, list movements, and label changes.
 
 ## Labels
 
@@ -158,11 +167,13 @@ Trello does not expose a multi-request transaction, so use one process per stage
 ## Normal task commands
 
 ```bash
-python "$helper" create --title "Task title" --desc "Short context" --list-key start
-python "$helper" comment --card abc123 --text "Focused tests passed."
-python "$helper" resume --card abc123
-python "$helper" finish --card abc123 --overview "Implemented and locally verified."
+python "$helper" create --title "Task title" --desc "Short context" --list-key start --thread-id <parent-task-id>
+python "$helper" comment --card abc123 --text "Focused tests passed." --thread-id <parent-task-id>
+python "$helper" resume --card abc123 --thread-id <parent-task-id>
+python "$helper" finish --card abc123 --overview "Implemented and locally verified." --thread-id <parent-task-id>
 ```
+
+When `ownership.requireLocalForStandardMutations` is enabled, create labels the card `AI Local`, prefixes the title with `[LOCAL]`, and records the parent task claim. Standard move, comment, resume, and finish operations fail unless the same parent task owns the card and no managed label or Buzz marker is present. Managed selection and claims automatically exclude `AI Local`.
 
 ## Tests
 

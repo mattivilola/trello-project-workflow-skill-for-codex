@@ -15,7 +15,7 @@ If `.codex/trello.json` is missing or the user asks to configure Trello for a pr
 
 1. Ask for the Trello board URL or short link. If the user has a board visible, ask for a screenshot/appshot and extract the board URL, board name, visible lists, and relevant labels.
 2. Ask which visible list corresponds to each semantic phase. Core keys are `start`, `implemented`, and `verified`; optional keys include `backlog`, `analyzed`, `verification`, `verificationReady`, `incomingBugs`, and `done`.
-3. Ask which labels act as workflow gates. Use semantic label keys such as `aiReady`, `aiManaged`, `aiNeedsInput`, and `aiHold` when appropriate.
+3. Ask which labels act as workflow gates. Use semantic label keys such as `aiReady`, `aiManaged`, `aiNeedsInput`, `aiHold`, and `aiLocal` when appropriate.
 4. Use `init-config` first without `--write` to preview the JSON.
 5. Write the config only after the user confirms the mappings, using `--write`. Do not overwrite an existing config unless the user explicitly approves it and `--force` is passed.
 6. Never place `TRELLO_KEY`, `TRELLO_TOKEN`, or other Trello secrets in `.codex/trello.json`.
@@ -28,7 +28,16 @@ Example optional label mapping:
     "aiReady": "AI Ready",
     "aiManaged": "AI Managed",
     "aiNeedsInput": "AI Needs Input",
-    "aiHold": "AI Hold"
+    "aiHold": "AI Hold",
+    "aiLocal": "AI Local"
+  },
+  "ownership": {
+    "localLabel": "aiLocal",
+    "localTitlePrefix": "[LOCAL]",
+    "localCommentPrefix": "AI-LOCAL",
+    "managedLabels": ["aiReady", "aiManaged", "aiNeedsInput", "aiHold"],
+    "managedCommentPrefixes": ["[BUZZ-AI:", "[AI-WORKFLOW:"],
+    "requireLocalForStandardMutations": true
   }
 }
 ```
@@ -66,7 +75,10 @@ Dev branches from the latest `development` branch in an isolated worktree. QA us
 
 ## Standard Project Workflow
 
-- Create normal task cards in `start`/`In Progress` when implementation begins.
+- When ownership enforcement is configured, only the parent local task mutates Trello. Delegated tasks report to the parent without creating, claiming, commenting on, or moving cards.
+- Create normal task cards in `start`/`In Progress` when implementation begins. Pass the parent task ID with `--thread-id`; the helper creates the card with `AI Local`, prefixes its title with `[LOCAL]`, and adds an `[AI-LOCAL:CLAIM ...]` comment.
+- Local move, comment, resume, and finish operations require the same `--thread-id`. They fail closed unless the card has `AI Local`, has the matching local claim, and has no managed label or Buzz marker.
+- Managed selection and `claim` automatically exclude `AI Local`. Adding `AI Local` to a managed card, or a managed ownership label to an `AI Local` card, is rejected.
 - Move cards to `implemented`/`Dev Ready` after implementation and local verification, with a compact overview comment.
 - Move cards to `verified` when the user confirms verification or staging handoff.
 - If the same task continues after reaching `implemented`, use `resume` to return that card to `start` and add a short comment.
@@ -93,10 +105,10 @@ python "$helper" claim --card abc123 --from analyzed --to start \
   --expected-last-activity "2026-07-30T10:00:00.000Z" \
   --require-label aiManaged --exclude-label aiHold \
   --comment "[Codex Dev] Claimed for implementation." --dry-run
-python "$helper" create --title "Task title" --desc "Short context" --list-key start
-python "$helper" comment --card abc123 --text "Implemented and locally verified."
-python "$helper" resume --card abc123
-python "$helper" finish --card abc123 --overview "Updated workflow behavior and focused tests passed."
+python "$helper" create --title "Task title" --desc "Short context" --list-key start --thread-id <parent-task-id>
+python "$helper" comment --card abc123 --text "Implemented and locally verified." --thread-id <parent-task-id>
+python "$helper" resume --card abc123 --thread-id <parent-task-id>
+python "$helper" finish --card abc123 --overview "Updated workflow behavior and focused tests passed." --thread-id <parent-task-id>
 ```
 
 `next-card` prints JSON `null` and exits successfully when nothing is eligible. Repeated label flags are cumulative: every `--require-label` must be present, while any `--exclude-label` prevents selection or a claim.
@@ -107,6 +119,7 @@ Use `--dry-run` on `init-config`, `create`, `move`, `comment`, `add-label`, `rem
 
 - Do not delete, archive, close, bulk edit, merge, deploy, or otherwise perform destructive/external operations unless the user explicitly authorizes that exact phase.
 - Label changes are restricted to existing, uniquely named board labels; this helper never creates labels implicitly.
+- With ownership enforcement enabled, missing `AI Local`, a mismatched local claim, any managed label, or a Buzz marker blocks standard mutations. Unlabeled legacy cards are never silently adopted.
 - `claim` is guarded and recoverable but Trello does not provide a multi-request transaction. Use one active agent per stage plus an external lock.
 - Treat `dateLastActivity` as an optimistic concurrency guard. If it changes, reread the card instead of forcing the move.
 - A Trello user token grants access to that user's account. Prefer a dedicated automation user invited only to the required board.

@@ -12,6 +12,10 @@ API_BASE = 'https://api.trello.com/1'
 DEFAULT_CARD_PREFIX = ''
 DEFAULT_CARD_POSITION = 'top'
 
+DEFAULT_LOCAL_TITLE_PREFIX = '[LOCAL]'
+DEFAULT_LOCAL_COMMENT_PREFIX = 'AI-LOCAL'
+DEFAULT_MANAGED_COMMENT_PREFIXES = ('[BUZZ-AI:', '[AI-WORKFLOW:')
+
 
 class TrelloError(Exception):
     pass
@@ -129,6 +133,67 @@ def configured_labels(config):
     if not isinstance(labels, dict):
         raise TrelloError('Invalid labels mapping in .codex/trello.json; expected an object')
     return labels
+
+
+def configured_ownership(config):
+    ownership = config.get('ownership') or {}
+    if not isinstance(ownership, dict):
+        raise TrelloError('Invalid ownership mapping in .codex/trello.json; expected an object')
+    return ownership
+
+
+def local_ownership_enabled(config):
+    return bool(configured_ownership(config).get('requireLocalForStandardMutations'))
+
+
+def local_label_ref(config):
+    return str(configured_ownership(config).get('localLabel') or 'aiLocal').strip()
+
+
+def managed_label_refs(config):
+    values = configured_ownership(config).get('managedLabels') or []
+    if not isinstance(values, list):
+        raise TrelloError('Invalid ownership.managedLabels; expected an array')
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def managed_comment_prefixes(config):
+    values = configured_ownership(config).get('managedCommentPrefixes')
+    if values is None:
+        return list(DEFAULT_MANAGED_COMMENT_PREFIXES)
+    if not isinstance(values, list):
+        raise TrelloError('Invalid ownership.managedCommentPrefixes; expected an array')
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def local_title_prefix(config):
+    return str(
+        configured_ownership(config).get('localTitlePrefix')
+        or DEFAULT_LOCAL_TITLE_PREFIX
+    ).strip()
+
+
+def local_comment_prefix(config):
+    return str(
+        configured_ownership(config).get('localCommentPrefix')
+        or DEFAULT_LOCAL_COMMENT_PREFIX
+    ).strip().strip('[]:')
+
+
+def require_thread_id(args):
+    thread_id = str(getattr(args, 'thread_id', '') or '').strip()
+    if not thread_id or any(character.isspace() for character in thread_id):
+        raise TrelloError('Local Trello mutations require a non-empty whitespace-free --thread-id')
+    return thread_id
+
+
+def local_marker(config, action, thread_id, text=None):
+    marker = f'[{local_comment_prefix(config)}:{action} thread={thread_id}]'
+    return f'{marker} {text.strip()}' if text and text.strip() else marker
+
+
+def local_claim_marker(config, thread_id):
+    return local_marker(config, 'CLAIM', thread_id)
 
 
 def fetch_board_lists(config):
@@ -289,6 +354,13 @@ def card_name_with_configured_prefix(title, prefix):
     return strip_named_prefix(name, 'Codex')
 
 
+def card_name_with_local_prefix(config, name):
+    prefix = local_title_prefix(config)
+    if not prefix or name.lower().startswith(prefix.lower()):
+        return name
+    return f'{prefix} {name}'
+
+
 def normalize_card_id(card):
     if 'trello.com/c/' in card:
         parts = urllib.parse.urlparse(card)
@@ -325,6 +397,104 @@ def card_has_exact_comment(card_id, text):
         (action.get('data') or {}).get('text') == text
         for action in (actions or [])
     )
+
+
+def fetch_card_comments(card_id):
+    actions = request_json('GET', f'/cards/{card_id}/actions', {
+        'filter': 'commentCard',
+        'limit': 1000
+    })
+    return [
+        str((action.get('data') or {}).get('text') or '')
+        for action in (actions or [])
+    ]
+
+
+def ownership_summary(config, card, comment_texts):
+    ownership = configured_ownership(config)
+    if not ownership:
+        return {'enabled': False, 'lane': 'unconfigured'}
+
+    label_names = {
+        str(label.get('name') or '').strip().lower()
+        for label in card.get('labels', [])
+        if str(label.get('name') or '').strip()
+    }
+    local_name = configured_label_name(config, local_label_ref(config)).lower()
+    managed_names = {
+        configured_label_name(config, ref).lower()
+        for ref in managed_label_refs(config)
+    }
+    local_prefix = f'[{local_comment_prefix(config)}:'.lower()
+    buzz_prefixes = [prefix.lower() for prefix in managed_comment_prefixes(config)]
+    has_local_label = local_name in label_names
+    has_managed_label = bool(label_names & managed_names)
+    has_local_marker = any(text.lstrip().lower().startswith(local_prefix) for text in comment_texts)
+    has_managed_marker = any(
+        text.lstrip().lower().startswith(prefix)
+        for text in comment_texts
+        for prefix in buzz_prefixes
+    )
+
+    if (has_local_label or has_local_marker) and (has_managed_label or has_managed_marker):
+        lane = 'conflict'
+    elif has_local_label or has_local_marker:
+        lane = 'local'
+    elif has_managed_label or has_managed_marker:
+        lane = 'managed'
+    else:
+        lane = 'unowned'
+    return {
+        'enabled': True,
+        'lane': lane,
+        'hasLocalLabel': has_local_label,
+        'hasManagedLabel': has_managed_label,
+        'hasLocalMarker': has_local_marker,
+        'hasManagedMarker': has_managed_marker
+    }
+
+
+def resolve_ownership_labels(config, board_labels=None):
+    items = board_labels if board_labels is not None else fetch_board_labels(config)
+    local = require_label(config, local_label_ref(config), items)
+    managed = [require_label(config, ref, items) for ref in managed_label_refs(config)]
+    return local, managed
+
+
+def require_local_card(config, card_id, thread_id):
+    card = fetch_card_state(card_id)
+    if card.get('closed'):
+        raise TrelloError('Local mutation rejected: card is closed')
+    local, managed = resolve_ownership_labels(config)
+    present = set(card.get('idLabels') or [])
+    if local['id'] not in present:
+        raise TrelloError(f'Local mutation rejected: missing required label {local["name"]}')
+    conflicting = [label['name'] for label in managed if label['id'] in present]
+    if conflicting:
+        raise TrelloError(
+            'Local mutation rejected: managed label(s) present: ' + ', '.join(conflicting)
+        )
+    comments = fetch_card_comments(card_id)
+    prefixes = [prefix.lower() for prefix in managed_comment_prefixes(config)]
+    if any(
+        text.lstrip().lower().startswith(prefix)
+        for text in comments
+        for prefix in prefixes
+    ):
+        raise TrelloError('Local mutation rejected: Buzz ownership marker present')
+    claim = local_claim_marker(config, thread_id)
+    if claim not in comments:
+        raise TrelloError(
+            f'Local mutation rejected: missing matching local claim marker {claim}'
+        )
+    return card
+
+
+def local_guard(config, args, card_id):
+    if not local_ownership_enabled(config):
+        return None, None
+    thread_id = require_thread_id(args)
+    return thread_id, require_local_card(config, card_id, thread_id)
 
 
 def command_config_check(args):
@@ -466,9 +636,17 @@ def command_next_card(args):
     _, config = load_config(args.cwd)
     trello_list = require_list(config, args.list_key)
     cards = fetch_list_cards(trello_list)
-    board_labels = fetch_board_labels(config) if args.require_label or args.exclude_label else []
+    board_labels = (
+        fetch_board_labels(config)
+        if args.require_label or args.exclude_label or configured_ownership(config)
+        else []
+    )
     required = [require_label(config, ref, board_labels) for ref in args.require_label]
     excluded = [require_label(config, ref, board_labels) for ref in args.exclude_label]
+    if configured_ownership(config):
+        local, _ = resolve_ownership_labels(config, board_labels)
+        if local['id'] not in {label['id'] for label in excluded}:
+            excluded.append(local)
     matches = [
         card for card in cards
         if card_matches_label_ids(card, required, excluded)
@@ -558,6 +736,11 @@ def command_card_context(args):
         'checkItem_fields': 'name,state,pos'
     })
     actions = fetch_card_actions(card_id, args.actions_limit)
+    comment_texts = [
+        str((action.get('data') or {}).get('text') or '')
+        for action in actions
+        if action.get('type') == 'commentCard'
+    ]
     creator_action = next((action for action in actions if action.get('type') == 'createCard'), None)
     board_lists = fetch_board_lists(config)
     list_by_id = {item['id']: item['name'] for item in board_lists}
@@ -569,6 +752,7 @@ def command_card_context(args):
             'id': card.get('idList'),
             'name': list_by_id.get(card.get('idList'))
         },
+        'ownership': ownership_summary(config, card, comment_texts),
         'creator': (
             normalize_member(creator_action.get('memberCreator') or {})
             if creator_action else None
@@ -617,7 +801,20 @@ def command_create(args):
     _, config = load_config(args.cwd)
     defaults = config.get('cardDefaults') or {}
     pos = args.pos or defaults.get('position') or 'top'
-    name = card_name_with_configured_prefix(args.title, defaults.get('prefix'))
+    title = args.title.strip()
+    if local_ownership_enabled(config):
+        prefix = local_title_prefix(config)
+        if prefix and title.lower().startswith(prefix.lower()):
+            title = title[len(prefix):].lstrip(' :')
+    name = card_name_with_configured_prefix(title, defaults.get('prefix'))
+    thread_id = None
+    local_label = None
+    claim_text = None
+    if local_ownership_enabled(config):
+        thread_id = require_thread_id(args)
+        local_label, _ = resolve_ownership_labels(config)
+        name = card_name_with_local_prefix(config, name)
+        claim_text = local_claim_marker(config, thread_id)
     if args.dry_run:
         list_name = configured_list_name(config, args.list_key)
         print_json({
@@ -630,8 +827,10 @@ def command_create(args):
             'payload': {
                 'name': name,
                 'desc': args.desc or '',
-                'pos': pos
-            }
+                'pos': pos,
+                **({'idLabels': [local_label['id']]} if local_label else {})
+            },
+            **({'claimComment': claim_text} if claim_text else {})
         })
         return 0
     trello_list = require_list(config, args.list_key)
@@ -641,13 +840,25 @@ def command_create(args):
         'desc': args.desc or '',
         'pos': pos
     }
+    if local_label:
+        payload['idLabels'] = local_label['id']
     card = request_json('POST', '/cards', data=payload)
-    print_json({
+    result = {
         'id': card['id'],
         'shortLink': card.get('shortLink'),
         'name': card.get('name'),
         'url': card.get('url')
-    })
+    }
+    if claim_text:
+        action = add_card_comment(card['id'], claim_text)
+        result['ownership'] = {
+            'lane': 'local',
+            'label': normalize_label(local_label),
+            'threadId': thread_id,
+            'claimComment': claim_text,
+            'commentActionId': action.get('id')
+        }
+    print_json(result)
     return 0
 
 
@@ -655,6 +866,10 @@ def command_move(args):
     _, config = load_config(args.cwd)
     card_id = normalize_card_id(args.card)
     pos = args.pos or DEFAULT_CARD_POSITION
+    thread_id, _ = local_guard(config, args, card_id)
+    comment = args.comment
+    if thread_id and comment:
+        comment = local_marker(config, 'MOVE', thread_id, comment)
     if args.dry_run:
         list_name = configured_list_name(config, args.to)
         print_json({
@@ -662,7 +877,7 @@ def command_move(args):
             'operation': 'move',
             'card': card_id,
             'pos': pos,
-            'comment': args.comment,
+            'comment': comment,
             'to': {
                 'key': args.to,
                 'name': list_name
@@ -681,8 +896,8 @@ def command_move(args):
             'name': trello_list['name']
         }
     }
-    if args.comment:
-        action = add_card_comment(card_id, args.comment)
+    if comment:
+        action = add_card_comment(card_id, comment)
         result['comment'] = {
             'id': action['id'],
             'type': action.get('type'),
@@ -693,20 +908,24 @@ def command_move(args):
 
 
 def command_comment(args):
-    load_config(args.cwd)
+    _, config = load_config(args.cwd)
     card_id = normalize_card_id(args.card)
+    thread_id, _ = local_guard(config, args, card_id)
+    text = args.text
+    if thread_id:
+        text = local_marker(config, 'COMMENT', thread_id, text)
     payload = {
-        'text': args.text
+        'text': text
     }
     if args.dry_run:
         print_json({
             'dryRun': True,
             'operation': 'comment',
             'card': card_id,
-            'text': args.text
+            'text': text
         })
         return 0
-    action = add_card_comment(card_id, args.text)
+    action = add_card_comment(card_id, text)
     print_json({
         'id': action['id'],
         'type': action.get('type'),
@@ -731,10 +950,37 @@ def command_change_label(args, add):
     _, config = load_config(args.cwd)
     card_id = normalize_card_id(args.card)
     card = fetch_card_state(card_id)
-    label = require_label(config, args.label)
+    board_labels = fetch_board_labels(config)
+    label = require_label(config, args.label, board_labels)
     present = label['id'] in (card.get('idLabels') or [])
     changed = (add and not present) or (not add and present)
     operation = 'add-label' if add else 'remove-label'
+
+    if add and changed and configured_ownership(config):
+        local, managed = resolve_ownership_labels(config, board_labels)
+        present_ids = set(card.get('idLabels') or [])
+        managed_ids = {item['id'] for item in managed}
+        if label['id'] == local['id'] and present_ids & managed_ids:
+            raise TrelloError('Cannot add AI Local while a managed ownership label is present')
+        if label['id'] in managed_ids and local['id'] in present_ids:
+            raise TrelloError('Cannot add a managed ownership label while AI Local is present')
+        if label['id'] == local['id'] or label['id'] in managed_ids:
+            comments = fetch_card_comments(card_id)
+            local_prefix = f'[{local_comment_prefix(config)}:'.lower()
+            buzz_prefixes = [prefix.lower() for prefix in managed_comment_prefixes(config)]
+            if label['id'] == local['id'] and any(
+                text.lstrip().lower().startswith(prefix)
+                for text in comments
+                for prefix in buzz_prefixes
+            ):
+                raise TrelloError('Cannot add AI Local while a Buzz ownership marker is present')
+            if label['id'] in managed_ids and any(
+                text.lstrip().lower().startswith(local_prefix)
+                for text in comments
+            ):
+                raise TrelloError(
+                    'Cannot add a managed ownership label while an AI Local marker is present'
+                )
 
     if args.dry_run:
         print_json({
@@ -796,6 +1042,10 @@ def command_claim(args):
     board_labels = fetch_board_labels(config)
     required = [require_label(config, ref, board_labels) for ref in args.require_label]
     excluded = [require_label(config, ref, board_labels) for ref in args.exclude_label]
+    if configured_ownership(config):
+        local, _ = resolve_ownership_labels(config, board_labels)
+        if local['id'] not in {label['id'] for label in excluded}:
+            excluded.append(local)
     add_labels = [require_label(config, ref, board_labels) for ref in args.add_label]
     remove_labels = [require_label(config, ref, board_labels) for ref in args.remove_label]
     present_ids = set(card.get('idLabels') or [])
@@ -896,6 +1146,9 @@ def command_resume(args):
     card_id = normalize_card_id(args.card)
     pos = args.pos or DEFAULT_CARD_POSITION
     text = args.text or 'Work resumed: continuing implementation on this task.'
+    thread_id, _ = local_guard(config, args, card_id)
+    if thread_id:
+        text = local_marker(config, 'RESUME', thread_id, text)
     if args.dry_run:
         list_name = configured_list_name(config, 'start')
         print_json({
@@ -941,6 +1194,9 @@ def command_finish(args):
     text = overview
     if not text.lower().startswith('implemented:'):
         text = f'Implemented: {text}'
+    thread_id, _ = local_guard(config, args, card_id)
+    if thread_id:
+        text = local_marker(config, 'FINISH', thread_id, text)
     if args.dry_run:
         list_name = configured_list_name(config, args.to)
         print_json({
@@ -1035,6 +1291,7 @@ def build_parser():
     create.add_argument('--desc', default='')
     create.add_argument('--list-key', default='start')
     create.add_argument('--pos')
+    create.add_argument('--thread-id', help='Owning local Codex task ID when local ownership is enforced.')
     create.add_argument('--dry-run', action='store_true')
     create.set_defaults(func=command_create)
 
@@ -1043,12 +1300,14 @@ def build_parser():
     move.add_argument('--to', required=True)
     move.add_argument('--pos', default=DEFAULT_CARD_POSITION)
     move.add_argument('--comment')
+    move.add_argument('--thread-id', help='Owning local Codex task ID when local ownership is enforced.')
     move.add_argument('--dry-run', action='store_true')
     move.set_defaults(func=command_move)
 
     comment = subparsers.add_parser('comment')
     comment.add_argument('--card', required=True)
     comment.add_argument('--text', required=True)
+    comment.add_argument('--thread-id', help='Owning local Codex task ID when local ownership is enforced.')
     comment.add_argument('--dry-run', action='store_true')
     comment.set_defaults(func=command_comment)
 
@@ -1082,6 +1341,7 @@ def build_parser():
     resume.add_argument('--card', required=True)
     resume.add_argument('--text')
     resume.add_argument('--pos', default=DEFAULT_CARD_POSITION)
+    resume.add_argument('--thread-id', help='Owning local Codex task ID when local ownership is enforced.')
     resume.add_argument('--dry-run', action='store_true')
     resume.set_defaults(func=command_resume)
 
@@ -1090,6 +1350,7 @@ def build_parser():
     finish.add_argument('--overview', required=True)
     finish.add_argument('--to', default='implemented')
     finish.add_argument('--pos', default=DEFAULT_CARD_POSITION)
+    finish.add_argument('--thread-id', help='Owning local Codex task ID when local ownership is enforced.')
     finish.add_argument('--dry-run', action='store_true')
     finish.set_defaults(func=command_finish)
 
